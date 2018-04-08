@@ -16,6 +16,8 @@ import (
 
 const (
 	BlockElementSize = 4
+	DataFileSuffix = ".data"
+	IndexFileSuffix = ".index"
 )
 
 type fileMeta struct {
@@ -39,34 +41,38 @@ func (fm *fileMeta) Check() {
 	}
 }
 
-type ReqValue struct {
-	ReaderId int
-	SeekerId int
-	Value int
+type BlockValue struct {
+	ManagerId int
+	ReaderId  int
+	Value     int
 }
 
 /**
-  Assume data storage structure:
+  Sort block elements based on file storage.
+
+  We assume:
+  1. A single file contains a group of data blocks.
+  2. data storage structure:
   partition file suffix with '.data', block index files suffix with '.index', such as
     part-00000.data  part-00000.index
     part-00001.data  part-00001.index
   We can locate each block data.
  */
 type FileSort struct {
-	RootDir string
-	OutputPath string
-	outFile *os.File
-	recordReaders map[int]*FileRecordReader
+	RootDir           string
+	OutputPath        string
+	outFile           *os.File
+	partitionManagers map[int]*PartitionManager
 }
 
-func (fs *FileSort) isSeekerCompleted(readerId, seekerId int) bool {
-	return fs.recordReaders[readerId].offsetSeekers[seekerId].IsCompleted
+func (fs *FileSort) isReaderCompleted(managerId, readerId int) bool {
+	return fs.partitionManagers[managerId].blockReaders[readerId].IsCompleted
 }
 
-func (fs *FileSort) isSeekersCompleted() bool {
-	for _, reader := range fs.recordReaders {
-		for _, seeker := range reader.offsetSeekers {
-			if !seeker.IsCompleted {
+func (fs *FileSort) isAllReadersCompleted() bool {
+	for _, manager := range fs.partitionManagers {
+		for _, reader := range manager.blockReaders {
+			if !reader.IsCompleted {
 				return false
 			}
 		}
@@ -75,45 +81,46 @@ func (fs *FileSort) isSeekersCompleted() bool {
 }
 
 func (fs *FileSort) Sort(partitionFiles []string) {
-	fs.recordReaders = make(map[int]*FileRecordReader)
+	fs.partitionManagers = make(map[int]*PartitionManager)
 
-	// create file record readers
+	// create file partition managers
 	totalBlocks := 0
 	for i, file := range partitionFiles {
 		meta := NewFileMeta(i, fs.RootDir, file)
-		reader := NewFileRecordReader(i, meta)
-		reader.Initialize()
-		fs.recordReaders[i] = reader
-		totalBlocks += reader.blockCount
-		fmt.Println("Reader created: readerId=", i, ", blockCount=", reader.blockCount)
+		manager := NewPartitionManager(i, meta)
+		manager.Initialize()
+		managerId := i
+		fs.partitionManagers[managerId] = manager
+		totalBlocks += manager.blockCount
+		fmt.Println("Partition manager created: managerId=", managerId, ", blockCount=", manager.blockCount)
 	}
-	fmt.Println("Reader info: readerCount=", len(fs.recordReaders), ", totalBlocks=", totalBlocks)
-	ch := make(chan ReqValue, totalBlocks)
+	fmt.Println("Partition manager info: managerCount=", len(fs.partitionManagers), ", totalBlocks=", totalBlocks)
+	ch := make(chan BlockValue, totalBlocks)
 	defer close(ch)
 
 	// open output file for writing sorted results
 	fs.outFile, _ = os.Create(fs.OutputPath)
 	defer fs.outFile.Close()
 
-	// start file record readers
+	// start file partition managers
 	wg := &sync.WaitGroup{}
 	wg.Add(totalBlocks)
-	for id, reader := range fs.recordReaders {
-		reader.Start(ch, wg)
-		fmt.Println("Reader started: readerId=", id)
+	for id, manager := range fs.partitionManagers {
+		manager.Start(ch, wg)
+		fmt.Println("Partition manager started: managerId=", id)
 	}
 	wg.Wait()
 
 	// main process computes minimum element
-	fmt.Println("All readers started, prepare to sort partitions...")
-	reqCache := make([]ReqValue, 0)
+	fmt.Println("All partition manager started, prepare to sort partitions...")
+	reqBlockValueBuffer := make([]BlockValue, 0)
 
-	// notify seekers to offer values
+	// notify block readers to read & offer values
 	cnt := 0
-	for _, reader := range fs.recordReaders {
-		cnt += reader.SignalToOfferValues()
+	for _, manager := range fs.partitionManagers {
+		cnt += manager.SignalToOfferValues()
 	}
-	fmt.Println("Signaled ", cnt, "seekers to offer values.")
+	fmt.Println("Signaled ", cnt, "readers to offer block values.")
 
 	totalElements := 0
 	done := false
@@ -123,7 +130,7 @@ func (fs *FileSort) Sort(partitionFiles []string) {
 		for {
 			req := <-ch
 			cnt--
-			reqCache = append(reqCache, req)
+			reqBlockValueBuffer = append(reqBlockValueBuffer, req)
 			if cnt == 0 {
 				break
 			}
@@ -131,34 +138,34 @@ func (fs *FileSort) Sort(partitionFiles []string) {
 
 		// select the minimum element
 		for {
-			var selectedReq ReqValue
+			var selectedReq BlockValue
 			var selectedIndex int
 			minVal := MaxIntValue
-			for i, req := range reqCache {
+			for i, req := range reqBlockValueBuffer {
 				if req.Value < minVal {
 					minVal = req.Value
 					selectedReq = req
 					selectedIndex = i
 				}
 			}
-			if len(reqCache) > 1 {
-				reqCache = append(reqCache[:selectedIndex], reqCache[selectedIndex+1:]...)
+			if len(reqBlockValueBuffer) > 1 {
+				reqBlockValueBuffer = append(reqBlockValueBuffer[:selectedIndex], reqBlockValueBuffer[selectedIndex+1:]...)
 			} else {
-				reqCache = []ReqValue{}
+				reqBlockValueBuffer = []BlockValue{}
 			}
 
 			// write the element to the sorted files
 			fs.outFile.WriteString(fmt.Sprintf("%04d", minVal))
 			totalElements++
 
+			managerId := selectedReq.ManagerId
 			readerId := selectedReq.ReaderId
-			seekerId := selectedReq.SeekerId
-			if !fs.isSeekerCompleted(readerId, seekerId) {
-				fs.recordReaders[readerId].SeekNextValue(seekerId)
+			if !fs.isReaderCompleted(managerId, readerId) {
+				fs.partitionManagers[managerId].ReadNextValue(readerId)
 				cnt = 1
 				break
 			} else {
-				if len(reqCache) == 0 && fs.isSeekersCompleted() {
+				if len(reqBlockValueBuffer) == 0 && fs.isAllReadersCompleted() {
 					done = true
 					break
 				} else {
@@ -173,9 +180,9 @@ func (fs *FileSort) Sort(partitionFiles []string) {
 	fmt.Println("File sort completed: totalElements=", totalElements, ", sortedFile=", fs.OutputPath)
 }
 
-type OffsetSeeker struct {
+type BlockReader struct {
 	Id          int
-	ReaderId    int
+	ManagerId   int
 	StartOffset int64
 	BlockLen    int
 	DataFile    string
@@ -185,125 +192,126 @@ type OffsetSeeker struct {
 	currentPos  int
 }
 
-func (s * OffsetSeeker) Initialize() {
-	s.Queue = make(chan string, 1)
+func (br *BlockReader) Initialize() {
+	br.Queue = make(chan string, 1)
 	// open the data file
-	f, err := os.Open(s.DataFile)
+	f, err := os.Open(br.DataFile)
 	if err == nil {
-		s.filePointer = f
-		f.Seek(s.StartOffset, 1)
-		s.currentPos = int(s.StartOffset)
+		br.filePointer = f
+		f.Seek(br.StartOffset, 1)
+		br.currentPos = int(br.StartOffset)
 	}
 }
 
-func (s * OffsetSeeker) Run(ch chan ReqValue) {
+func (br *BlockReader) Run(ch chan BlockValue) {
 	size := BlockElementSize
 	defer func() {
-		s.filePointer.Close()
-		close(s.Queue)
+		br.filePointer.Close()
+		close(br.Queue)
 	}()
-	// manage file reading for the specified block
+	// manage block element reading for the specified block
 	for {
 		select {
-		case flag := <-s.Queue:
-		fmt.Println("Recv singal: readerId=", s.ReaderId, ", seekerId=", s.Id, ", flag=", flag)
+		case flag := <-br.Queue:
+			fmt.Println("Recv singal: managerId=", br.ManagerId, ", readerId=", br.Id, ", flag=", flag)
 			b := make([]byte, size)
-			s.filePointer.Read(b)
+			br.filePointer.Read(b)
 			value := string(b)
-			fmt.Println("Read block: readerId=", s.ReaderId, ", seekerId=", s.Id, ", startPos=", s.currentPos, ", endPos=", (s.currentPos+size), ", value=", value)
+			fmt.Println("Read block: managerId=", br.ManagerId, ", readerId=", br.Id, ", startPos=", br.currentPos, ", endPos=", (br.currentPos+size), ", value=", value)
 			elem, _ := strconv.Atoi(value)
-		fmt.Println("Offering value: readerId=", s.ReaderId, ", seekerId=", s.Id, ", value=", elem)
-			ch <- ReqValue{s.ReaderId, s.Id, elem}
-			s.currentPos += size
-			if s.currentPos >= int(s.StartOffset) + s.BlockLen {
-				s.IsCompleted = true
+			fmt.Println("Offering value: managerId=", br.ManagerId, ", readerId=", br.Id, ", value=", elem)
+
+			ch <- BlockValue{br.ManagerId, br.Id, elem}
+			br.currentPos += size
+			if br.currentPos >= int(br.StartOffset) + br.BlockLen {
+				br.IsCompleted = true
 			}
 		default:
 		}
 
-		// seeker is completed, break the loop
-		if s.IsCompleted {
-			fmt.Println("Seeker done: readerId=", s.ReaderId, ", seekerId=", s.Id)
+		// block reader is completed, break the loop
+		if br.IsCompleted {
+			fmt.Println("Block reader done: managerId=", br.ManagerId, ", readerId=", br.Id)
 			break
 		}
 	}
 }
 
-func (s *OffsetSeeker) SignalToOfferNext() {
-	s.Queue <- "X"
+func (br *BlockReader) SignalToOfferNext() {
+	br.Queue <- "X"
 }
 
-type FileRecordReader struct {
-	Id              int
-	IsAlive         bool
-	Queue           chan string
-	FileMeta	*fileMeta
-	offsetSeekers	map[int]*OffsetSeeker
-	blockCount	int
-	indexFile	string
-	dataFile	string
+type PartitionManager struct {
+	Id           int
+	IsAlive      bool
+	Queue        chan string
+	FileMeta     *fileMeta
+	blockReaders map[int]*BlockReader
+	blockCount   int
+	indexFile    string
+	dataFile     string
 }
 
-func NewFileRecordReader(id int, meta *fileMeta) *FileRecordReader {
+func NewPartitionManager(id int, meta *fileMeta) *PartitionManager {
 	meta.Check()
-	return &FileRecordReader{
+	return &PartitionManager{
 		Id: id,
 		FileMeta: meta,
 	}
 }
 
-func (r *FileRecordReader) Initialize() {
-	r.offsetSeekers = make(map[int]*OffsetSeeker)
+func (pm *PartitionManager) Initialize() {
+	pm.blockReaders = make(map[int]*BlockReader)
 	// index file line example:
 	// 0,18362	18362,3782	22144,213
-	r.indexFile = fmt.Sprintf("%s%s", filepath.Join(r.FileMeta.dir, r.FileMeta.fileName), IndexFileSuffix)
-	r.dataFile = fmt.Sprintf("%s%s", filepath.Join(r.FileMeta.dir, r.FileMeta.fileName), DataFileSuffix)
-	fmt.Println("Build files: readerId=", r.Id, ", files=(", r.indexFile, ", ", r.dataFile, ")")
+	pm.indexFile = fmt.Sprintf("%s%s", filepath.Join(pm.FileMeta.dir, pm.FileMeta.fileName), IndexFileSuffix)
+	pm.dataFile = fmt.Sprintf("%s%s", filepath.Join(pm.FileMeta.dir, pm.FileMeta.fileName), DataFileSuffix)
+	fmt.Println("Build files: managerId=", pm.Id, ", files=(", pm.indexFile, ", ", pm.dataFile, ")")
 	// parse index file
-	ibytes, ierr := ioutil.ReadFile(r.indexFile)
+	ibytes, ierr := ioutil.ReadFile(pm.indexFile)
 	if ierr == nil {
 		posInfos := strings.Split(string(ibytes), "\t")
 		// compute block count
-		r.blockCount = len(posInfos)
-		// create offset seekers
-		for i := 0; i < r.blockCount; i++ {
+		pm.blockCount = len(posInfos)
+		// create block readers
+		for i := 0; i < pm.blockCount; i++ {
 			offsetLenPair := strings.Split(posInfos[i], ",")
 			start, _ := strconv.Atoi(offsetLenPair[0])
 			length, _ := strconv.Atoi(offsetLenPair[1])
-			seeker := &OffsetSeeker{
-				ReaderId: r.Id,
+			reader := &BlockReader{
+				ManagerId: pm.Id,
 				Id: i,
 				StartOffset: int64(start),
 				BlockLen: length,
-				DataFile: r.dataFile,
+				DataFile: pm.dataFile,
 				IsCompleted: false,
 			}
-			fmt.Println("Seeker created: readerId=", r.Id, ", seekerId=", i, ", startOffset=", start, "blockLen=", length)
-			r.offsetSeekers[i] = seeker
+			fmt.Println("Block reader created: managerId=", pm.Id, ", readerId=", i, ", startOffset=", start, "blockLen=", length)
+			pm.blockReaders[i] = reader
 		}
 	}
 }
 
-func (r *FileRecordReader) Start(ch chan ReqValue, wg *sync.WaitGroup) {
-	for seekerId, seeker := range r.offsetSeekers {
-		seeker.Initialize()
-		go seeker.Run(ch)
-		fmt.Println("Seeker started: readerId=", r.Id, ", seekerId=", seekerId)
+func (pgm *PartitionManager) Start(ch chan BlockValue, wg *sync.WaitGroup) {
+	for readerId, reader := range pgm.blockReaders {
+		reader.Initialize()
+		go reader.Run(ch)
+		fmt.Println("Block reader started: managerId=", pgm.Id, ", readerId=", readerId)
 		wg.Done()
 	}
 }
 
-func (r *FileRecordReader) SeekNextValue(seekerId int) {
-	r.offsetSeekers[seekerId].SignalToOfferNext()
-	fmt.Println("Singaled seeker: readerId=", r.Id, ", seekerId=", seekerId)
+func (pm *PartitionManager) ReadNextValue(readerId int) {
+	pm.blockReaders[readerId].SignalToOfferNext()
+	fmt.Println("Singaled block reader: managerId=", pm.Id, ", readerId=", readerId)
 }
 
-func (r *FileRecordReader) SignalToOfferValues() int {
+func (pm *PartitionManager) SignalToOfferValues() int {
 	singledCount := 0
-	for _, seeker := range r.offsetSeekers {
-		if !seeker.IsCompleted {
-			seeker.SignalToOfferNext()
-			fmt.Println("Singaled seeker: readerId=", r.Id, ", seekerId=", seeker.Id)
+	for _, reader := range pm.blockReaders {
+		if !reader.IsCompleted {
+			reader.SignalToOfferNext()
+			fmt.Println("Singaled block reader: managerId=", pm.Id, ", readerId=", reader.Id)
 			singledCount++
 		}
 	}

@@ -27,33 +27,7 @@ func ParallelSort() []int {
 	return parallelSorter.Sort(partitions)
 }
 
-func PrintResult(sortedResult []int) {
-	for _, x := range sortedResult {
-		fmt.Print(x, " ")
-	}
-}
-
-func PrintHeader(content string) {
-	fmt.Println("=============================")
-	fmt.Println("|		", content, "		|")
-	fmt.Println("=============================")
-}
-
-func main() {
-	var result []int
-
-	// in-mem sorter
-	PrintHeader("IN MEM SORT")
-	result = InMemSort()
-	PrintResult(result)
-	fmt.Println()
-
-	// parallel sorter
-	PrintHeader("PARALLEL SORT")
-	result = ParallelSort()
-	PrintResult(result)
-	fmt.Println()
-
+func FileSort() {
 	// File sort
 	//
 	// 2 example partition files (part-00000, part-00001):
@@ -68,11 +42,43 @@ func main() {
 	//
 	// Sort result:
 	//    0001000200030004000500060007000900100011001200130014001500160018001900200021002200230024002700290038004300630066
-	PrintHeader("FILE SORT")
 	partitionFiles := []string{"part-00000", "part-00001"}
+	inputDir := "/Users/yanjun/Workspaces/go-workspace/learning-go/mysort/data/"
+	outputDir := "/Users/yanjun/Workspaces/go-workspace/learning-go/mysort/output/sorted_file.txt"
 	fileSorter := &mysort.FileSort{
-		RootDir: "/Users/yanjun/Workspaces/go-workspace/learning-go/mysort/data/",
-		OutputPath: "/Users/yanjun/Workspaces/go-workspace/learning-go/mysort/output/sorted_file.txt",
+		RootDir: inputDir,
+		OutputPath: outputDir,
 	}
 	fileSorter.Sort(partitionFiles)
+}
+
+func PrintResult(sortedResult []int) {
+	for _, x := range sortedResult {
+		fmt.Print(x, " ")
+	}
+}
+
+func PrintHeader(content string) {
+	fmt.Println("=============================")
+	fmt.Println("  |		", content, "		|")
+	fmt.Println("=============================")
+}
+
+func main() {
+	// in-mem sorter
+	PrintHeader("IN MEM SORT")
+	var result = InMemSort()
+	PrintResult(result)
+	fmt.Println()
+
+	// parallel sorter
+	PrintHeader("PARALLEL SORT")
+	result = ParallelSort()
+	PrintResult(result)
+	fmt.Println()
+
+	// file sorter
+	PrintHeader("FILE SORT")
+	FileSort()
+	fmt.Println()
 }

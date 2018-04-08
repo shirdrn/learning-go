@@ -11,26 +11,26 @@ type ParallelSorter struct {
 }
 
 type ReqElem struct {
-	WorkerId int
-	Value int
+	PickerId int
+	Value    int
 }
 
 func (ps *ParallelSorter) Sort(partitions []*Partition) []int {
 	pLen := len(partitions)
-	workers := make(map[int]*PartitionWorker, 0)
+	pickers := make(map[int]*BlockElementPicker, 0)
 	ch := make(chan ReqElem, pLen)
 	fmt.Println("pLen = ", pLen)
 	for i := 0; i < pLen; i ++ {
-		pw := NewWorker(i, partitions[i])
+		pw := NewPartitionElementPicker(i, partitions[i])
 		pw.Initialize()
-		workers[pw.Id] = pw
-		fmt.Println("workers = ", workers)
+		pickers[pw.Id] = pw
+		fmt.Println("pickers = ", pickers)
 		go pw.PickUp(ch)
 	}
-	return ps.control(ch, workers)
+	return ps.control(ch, pickers)
 }
 
-func (ps *ParallelSorter) control(ch chan ReqElem, workers map[int]*PartitionWorker) []int {
+func (ps *ParallelSorter) control(ch chan ReqElem, pickers map[int]*BlockElementPicker) []int {
 	a := make([]int, 0)
 	// main controller
 	round := 0
@@ -40,11 +40,11 @@ func (ps *ParallelSorter) control(ch chan ReqElem, workers map[int]*PartitionWor
 		fmt.Println(":::::: Round (", round, ") ::::::" )
 		round++
 		cnt := 0
-		for id, worker := range workers {
-			fmt.Println("workerId = ", id, ", isAlive = ", worker.IsAlive)
-			// notify workers to pick up an element
-			if worker.IsAlive {
-				worker.Queue <- "X"
+		for id, picker := range pickers {
+			fmt.Println("pickerId = ", id, ", isAlive = ", picker.IsAlive)
+			// notify pickers to pick up an element
+			if picker.IsAlive {
+				picker.Queue <- "X"
 				cnt++
 				fmt.Println("cnt=", cnt)
 			}
@@ -68,7 +68,7 @@ func (ps *ParallelSorter) control(ch chan ReqElem, workers map[int]*PartitionWor
 			if cnt == 0 {
 				a = append(a, minVal)
 				fmt.Println("Sorted area snapshot: ", a)
-				workers[thisReq.WorkerId].IncrOffset()
+				pickers[thisReq.PickerId].IncrOffset()
 				break
 			}
 		}
@@ -77,7 +77,7 @@ func (ps *ParallelSorter) control(ch chan ReqElem, workers map[int]*PartitionWor
 	return a
 }
 
-type PartitionWorker struct {
+type BlockElementPicker struct {
 	Id              int
 	IsAlive         bool
 	Queue           chan string
@@ -88,8 +88,8 @@ type PartitionWorker struct {
 	currentBucket   *BucketInfo
 }
 
-func NewWorker(id int, partition *Partition) *PartitionWorker {
-	return &PartitionWorker{
+func NewPartitionElementPicker(id int, partition *Partition) *BlockElementPicker {
+	return &BlockElementPicker{
 		Id: id,
 		IsAlive: true,
 		Queue: make(chan string, 1),
@@ -97,33 +97,33 @@ func NewWorker(id int, partition *Partition) *PartitionWorker {
 	}
 }
 
-func (w *PartitionWorker) Initialize() {
-	w.bucketInfoMap = make(map[int]*BucketInfo)
-	w.lenMap = make(map[int]int)
-	for _, blk := range w.partition.Blocks {
-		w.lenMap[blk.Id] = len(blk.Data)
-		w.bucketInfoMap[blk.Id] = &BucketInfo{blk.Id, blk, 0}
+func (p *BlockElementPicker) Initialize() {
+	p.bucketInfoMap = make(map[int]*BucketInfo)
+	p.lenMap = make(map[int]int)
+	for _, blk := range p.partition.Blocks {
+		p.lenMap[blk.Id] = len(blk.Data)
+		p.bucketInfoMap[blk.Id] = &BucketInfo{blk.Id, blk, 0}
 		fmt.Println("j=", blk.Id, ", blk=", blk)
 	}
 }
 
-func (w *PartitionWorker) PickUp(ch chan ReqElem) {
-	fmt.Println("PickUp enter: workerId = ", w.Id)
+func (p *BlockElementPicker) PickUp(ch chan ReqElem) {
+	fmt.Println("PickUp enter: pickerId = ", p.Id)
 	for {
 		select {
-		case flag := <- w.Queue:
-			fmt.Println("PickUp: workerId = ", w.Id, ", flag = ", flag)
-			var boundReachedCounter = len(w.lenMap)
+		case flag := <- p.Queue:
+			fmt.Println("PickUp: pickerId = ", p.Id, ", flag = ", flag)
+			var boundReachedCounter = len(p.lenMap)
 			var minVal = MaxIntValue
-		// iterate elements based on bucket info map
-			for bucketId, bi := range w.bucketInfoMap {
-				if bi.Pos < w.lenMap[bucketId] {
+			// iterate elements based on bucket info map
+			for bucketId, bi := range p.bucketInfoMap {
+				if bi.Pos < p.lenMap[bucketId] {
 					value := bi.Blk.Data[bi.Pos]
-					fmt.Println("Get: workerId = ", w.Id, ", value = ", value)
+					fmt.Println("Get: pickerId = ", p.Id, ", value = ", value)
 					if value < minVal {
 						minVal = value
-						w.currentBucketId = bucketId
-						w.currentBucket = bi
+						p.currentBucketId = bucketId
+						p.currentBucket = bi
 					}
 				} else {
 					boundReachedCounter--
@@ -133,36 +133,36 @@ func (w *PartitionWorker) PickUp(ch chan ReqElem) {
 				}
 			}
 			if minVal != MaxIntValue {
-				fmt.Println("Pickup: workerId = ", w.Id, ", value = ", minVal)
-				ch <- ReqElem{w.Id, minVal}
+				fmt.Println("Pickup: pickerId = ", p.Id, ", value = ", minVal)
+				ch <- ReqElem{p.Id, minVal}
 			}
 		default:
 		}
 
-		if !w.IsAlive {
+		if !p.IsAlive {
 			break
 		}
 	}
 }
 
-func (w *PartitionWorker) IncrOffset() {
-	if w.currentBucket.Pos <= w.lenMap[w.currentBucketId] - 1 {
-		w.currentBucket.Pos = 1 + w.currentBucket.Pos
+func (p *BlockElementPicker) IncrOffset() {
+	if p.currentBucket.Pos <= p.lenMap[p.currentBucketId] - 1 {
+		p.currentBucket.Pos = 1 + p.currentBucket.Pos
 	}
 
-	// check worker status
+	// check pickers status
 	done := true
-	for _, bi := range w.bucketInfoMap {
+	for _, bi := range p.bucketInfoMap {
 		if bi.Pos != len(bi.Blk.Data) {
 			done = false
 			break
 		}
 	}
 
-	fmt.Println("IncrOffset: workerId=", w.Id, ", pos = ", w.currentBucket.Pos)
+	fmt.Println("IncrOffset: pickerId=", p.Id, ", pos = ", p.currentBucket.Pos)
 
 	if done {
-		w.IsAlive = false
-		close(w.Queue)
+		p.IsAlive = false
+		close(p.Queue)
 	}
 }

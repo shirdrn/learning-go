@@ -2,8 +2,6 @@ package mysort
 
 const (
 	MaxIntValue = int(^uint(0) >> 1)
-	DataFileSuffix = ".data"
-	IndexFileSuffix = ".index"
 )
 
 type Sorter interface {
